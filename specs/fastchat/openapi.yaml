@@ -1,0 +1,1791 @@
+openapi: 3.1.0
+
+info:
+  title: fastchat REST API
+  version: 1.0.0
+  summary: Real-time chat backend exposing REST endpoints alongside a Socket.io WebSocket layer.
+  description: |
+    fastchat exposes a versioned REST API at `/api/v1` plus a single unversioned health endpoint at `/health`.
+    Real-time delivery, presence, typing, and read receipts are handled over Socket.io — see `asyncapi.yaml`.
+
+    ## Response envelope
+
+    Every JSON response (success or error) includes a `success` flag and a `timestamp`. Successful list endpoints
+    spread the pagination metadata to the response root, so a paginated body looks like:
+
+    ```json
+    {
+      "success": true,
+      "message": "Chats fetched successfully",
+      "data": [ /* array of items */ ],
+      "pagination": { "page": 1, "limit": 20, "total": 100, "totalPages": 5, "hasNextPage": true, "hasPrevPage": false },
+      "timestamp": "2024-01-21T10:30:00.000Z"
+    }
+    ```
+
+    Non-paginated successes nest payload under `data` (typed per operation). Error bodies use the `ErrorEnvelope`
+    schema and always include `requestId` matching the `X-Request-Id` response header.
+
+    ## Authentication
+
+    fastchat issues two tokens at login:
+
+    - **Access token** — JWT (HS256), 15-minute TTL by default. Sent as `Authorization: Bearer <token>`.
+    - **Refresh token** — opaque 128-character hex string, 7-day TTL by default. Sent as the `refresh_token`
+      field of an `application/x-www-form-urlencoded` body to `/auth/logout` and `/auth/refresh`. The token is
+      rotated on every successful refresh — the previous token is burned atomically.
+
+    ## Rate limiting
+
+    The `/auth/*` family is limited to **5 requests per 15 minutes per IP**, and the `/chats/{chatId}/messages`
+    family to **100 requests per 15 minutes per IP**. Both use a Redis-backed `express-rate-limit` store. Limits can
+    be disabled at deploy time with `DISABLE_RATE_LIMIT=true`. When the limit is exceeded the response carries the
+    standard `RateLimit-*` headers and a default `express-rate-limit` text body — clients should rely on
+    headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`, `Retry-After`), not the body shape.
+
+    ## Request hygiene
+
+    - JSON and URL-encoded bodies are limited to 10 MB.
+    - All string inputs in JSON bodies pass through an XSS sanitizer; object keys starting with `$` or containing `.`
+      are stripped to prevent NoSQL injection.
+    - Every request is assigned a UUID at ingress, returned as `X-Request-Id`.
+  contact:
+    name: fastchat
+  license:
+    name: ISC
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+  - url: https://fastchat.duckdns.org
+    description: Public deployment (referenced in docs/API_REST.md)
+
+tags:
+  - name: Health
+    description: Service health probe.
+  - name: Auth
+    description: Signup, login, logout, and token rotation.
+  - name: Users
+    description: User profiles, avatar management, and password change.
+  - name: Chats
+    description: Private and group chats — CRUD on the chat resource itself.
+  - name: Members
+    description: Group chat membership management.
+  - name: Messages
+    description: Sending, fetching, editing, and deleting messages within a chat.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      security: []
+      summary: Service and database health
+      description: |
+        Pings MongoDB, PostgreSQL, and Redis with a 2-second timeout each. Returns `200 OK` when all three are
+        reachable; otherwise returns `503 Service Unavailable` with `status: "DEGRADED"` and the failing checks
+        marked `error`.
+      responses:
+        '200':
+          description: All databases are healthy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+              example:
+                uptime: 1234.56
+                timestamp: 1706000000000
+                status: OK
+                environment: development
+                version: 1.0.0
+                checks:
+                  mongodb: connected
+                  postgresql: connected
+                  redis: connected
+        '503':
+          description: One or more databases are unreachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthReport' }
+              example:
+                uptime: 1234.56
+                timestamp: 1706000000000
+                status: DEGRADED
+                environment: production
+                version: 1.0.0
+                checks:
+                  mongodb: connected
+                  postgresql: error
+                  redis: connected
+
+  /api/v1/auth/signup:
+    post:
+      operationId: signup
+      tags: [Auth]
+      security: []
+      summary: Register a new account
+      description: |
+        Creates a new user and an empty profile. Passwords are hashed with bcrypt before storage.
+        Subject to the auth rate limit (5 per 15 minutes).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SignupRequest' }
+            example:
+              email: alice@example.com
+              username: alice
+              password: Password@123
+      responses:
+        '201':
+          description: Account created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [user]
+                        properties:
+                          user: { $ref: '#/components/schemas/UserSummary' }
+              example:
+                success: true
+                message: User created successfully
+                data:
+                  user:
+                    id: 4d1e92f0-9f67-4c4e-8a47-2b40bb5a91b9
+                    username: alice
+                    email: alice@example.com
+                    role: user
+                timestamp: '2024-01-21T10:30:00.000Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/SignupConflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/login:
+    post:
+      operationId: login
+      tags: [Auth]
+      security: []
+      summary: Exchange credentials for an access + refresh token pair
+      description: |
+        Provide **either** `email` or `username` (not both, not neither) along with the `password`.
+        Subject to the auth rate limit (5 per 15 minutes).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            examples:
+              byEmail:
+                summary: Login with email
+                value: { email: alice@example.com, password: Password@123 }
+              byUsername:
+                summary: Login with username
+                value: { username: alice, password: Password@123 }
+      responses:
+        '200':
+          description: Authenticated; token pair issued.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AuthSession' }
+              example:
+                success: true
+                message: User logged in successfully
+                data:
+                  user:
+                    id: 4d1e92f0-9f67-4c4e-8a47-2b40bb5a91b9
+                    username: alice
+                    email: alice@example.com
+                    role: user
+                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  refreshToken: 9f6e5c4b3a2918...
+                timestamp: '2024-01-21T10:30:00.000Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Invalid credentials.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: INVALID_CREDENTIALS, message: Invalid email/username or password }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/logout:
+    post:
+      operationId: logout
+      tags: [Auth]
+      security: []
+      summary: Revoke a refresh token
+      description: |
+        Deletes the supplied refresh token from Redis. The associated access token is **not** invalidated and
+        continues to work until it expires naturally. The request body must be `application/x-www-form-urlencoded`
+        — JSON is rejected by Joi.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/RefreshTokenForm' }
+            example:
+              refresh_token: 9f6e5c4b3a2918...
+      responses:
+        '200':
+          description: Session revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example:
+                success: true
+                message: User logged out successfully
+                data: null
+                timestamp: '2024-01-21T10:30:00.000Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Token not present in Redis (never issued, already revoked, or expired).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: SESSION_NOT_FOUND, message: Session not found or already terminated }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/refresh:
+    post:
+      operationId: refreshSession
+      tags: [Auth]
+      security: []
+      summary: Rotate the access + refresh token pair
+      description: |
+        Burns the supplied refresh token and atomically issues a new pair. The request body must be
+        `application/x-www-form-urlencoded`.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/RefreshTokenForm' }
+            example:
+              refresh_token: 9f6e5c4b3a2918...
+      responses:
+        '200':
+          description: New token pair issued.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/TokenPair' }
+              example:
+                success: true
+                message: Tokens refreshed successfully
+                data:
+                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  refreshToken: 7a3c4b9e1d2f8...
+                timestamp: '2024-01-21T10:30:00.000Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Refresh token has been revoked or expired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: REFRESH_TOKEN_REVOKED, message: 'Session expired or invalid. Please log in again.' }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/users:
+    get:
+      operationId: listUsers
+      tags: [Users]
+      security: []
+      summary: List users
+      description: |
+        Returns a paginated, optionally filtered/searched list of users. Open endpoint — no authentication required.
+        `password_hash` is never included.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/SortParam'
+        - $ref: '#/components/parameters/SearchParam'
+        - $ref: '#/components/parameters/RoleFilterParam'
+      responses:
+        '200':
+          description: Paginated user list.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/User' }
+
+  /api/v1/users/me:
+    get:
+      operationId: getCurrentUser
+      tags: [Users]
+      summary: Get the authenticated user
+      responses:
+        '200':
+          description: Current user profile.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [user]
+                        properties: { user: { $ref: '#/components/schemas/User' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      operationId: updateCurrentUser
+      tags: [Users]
+      summary: Update the authenticated user's profile
+      description: At least one of `username` or `bio` must be present.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMeRequest' }
+            example: { username: alice2, bio: 'Hello from fastchat!' }
+      responses:
+        '200':
+          description: Updated user profile.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [user]
+                        properties: { user: { $ref: '#/components/schemas/User' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Username already taken.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: USERNAME_ALREADY_TAKEN, message: Username already taken }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    delete:
+      operationId: deleteCurrentUser
+      tags: [Users]
+      summary: Permanently delete the authenticated user
+      description: |
+        Hard-deletes the user row (cascades to the profile). If the user has an avatar, the file is also removed
+        from S3 — failure to delete the avatar is logged but does **not** block account deletion.
+      responses:
+        '200':
+          description: Account deleted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [user]
+                        properties: { user: { $ref: '#/components/schemas/User' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/users/me/avatar:
+    post:
+      operationId: uploadAvatar
+      tags: [Users]
+      summary: Upload or replace the authenticated user's avatar
+      description: |
+        Requires `S3_ENABLED=true` at deploy time; without it the route returns `500`. Any existing avatar is
+        deleted from S3 before the new one is written. The stored `avatar` value is the full S3 URL.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: '#/components/schemas/AvatarUploadRequest' }
+            encoding:
+              avatar:
+                contentType: image/jpeg, image/jpg, image/png, image/gif
+      responses:
+        '200':
+          description: Avatar stored.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [user]
+                        properties: { user: { $ref: '#/components/schemas/User' } }
+        '400':
+          description: No file was provided in the multipart payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: BAD_REQUEST, message: Please upload an image file }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500':
+          description: S3 upload failed (storage error or `S3_ENABLED=false`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    delete:
+      operationId: deleteAvatar
+      tags: [Users]
+      summary: Remove the authenticated user's avatar
+      description: |
+        Deletes the avatar file from S3 and clears the `profiles.avatar` column. Safe to call when no avatar is
+        set (the column is simply nulled).
+      responses:
+        '200':
+          description: 'Avatar removed; user object now has `avatar: null`.'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [user]
+                        properties: { user: { $ref: '#/components/schemas/User' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/users/me/password:
+    patch:
+      operationId: changePassword
+      tags: [Users]
+      summary: Change the authenticated user's password
+      description: |
+        `newPassword` must satisfy the password complexity rule and **must differ** from `currentPassword`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePasswordRequest' }
+            example: { currentPassword: Password@123, newPassword: NewPassword@456 }
+      responses:
+        '200':
+          description: Password changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example:
+                success: true
+                message: Password changed successfully
+                data: null
+                timestamp: '2024-01-21T10:30:00.000Z'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Authentication failed or current password is wrong.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              examples:
+                invalidPassword:
+                  summary: Current password incorrect
+                  value:
+                    success: false
+                    error: { code: INVALID_PASSWORD, message: The password provided is incorrect }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+                missingToken:
+                  summary: Access token missing
+                  value:
+                    success: false
+                    error: { code: MISSING_TOKEN, message: Authorization token missing }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+
+  /api/v1/users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserIdParam'
+    get:
+      operationId: getUserById
+      tags: [Users]
+      security: []
+      summary: Get a user by ID
+      description: Open endpoint — no authentication required. The UUID is validated; malformed IDs return 400.
+      responses:
+        '200':
+          description: User found.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [user]
+                        properties: { user: { $ref: '#/components/schemas/User' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/chats:
+    get:
+      operationId: listChats
+      tags: [Chats]
+      summary: List the authenticated user's chats
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/ChatTypeFilterParam'
+        - $ref: '#/components/parameters/SortParam'
+      responses:
+        '200':
+          description: Paginated chat list (only chats where the caller is a participant).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Chat' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createChat
+      tags: [Chats]
+      summary: Create a private or group chat
+      description: |
+        The authenticated user is automatically added to `participants` server-side, and (for groups) is set as
+        `admin`. Validation rules:
+        - **Private**: `participants` must contain exactly one *other* user; `groupName` must be absent.
+        - **Group**: `participants` must contain at least one other user; `groupName` is required (1–50 chars).
+
+        Every supplied participant ID must (a) be a valid UUID, (b) be unique in the array, and (c) reference
+        an existing user — otherwise the request fails with `USER_NOT_FOUND`.
+
+        **Idempotent for private chats.** Each unordered pair of users maps to a single chat (keyed on a
+        deterministic `chatKey`). Calling this endpoint with the same pair twice returns the same chat —
+        no duplicate is created. See also `POST /api/v1/messages/direct` for sending without a pre-existing
+        chat.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateChatRequest' }
+            examples:
+              private:
+                summary: Private 1-on-1 chat
+                value:
+                  type: private
+                  participants: [b1ff2b8e-9c45-4f4d-9b6c-22d6c0b7ff5a]
+              group:
+                summary: Group chat
+                value:
+                  type: group
+                  groupName: Team Chat
+                  participants:
+                    - b1ff2b8e-9c45-4f4d-9b6c-22d6c0b7ff5a
+                    - 8f5d18a3-32e6-4f0b-9d50-71b3a204bb77
+      responses:
+        '201':
+          description: Chat created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [chat]
+                        properties: { chat: { $ref: '#/components/schemas/Chat' } }
+        '400':
+          description: Validation failed or one or more participants do not exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              examples:
+                validation:
+                  summary: Joi validation failure
+                  value:
+                    success: false
+                    error:
+                      code: VALIDATION_FAILED
+                      message: Invalid request data
+                      details:
+                        - { path: 'body.participants', message: 'A private chat must have exactly 2 participants.' }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+                missingUser:
+                  summary: A participant ID did not resolve to a real user
+                  value:
+                    success: false
+                    error: { code: USER_NOT_FOUND, message: One or more selected participants does not exist }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/chats/{chatId}:
+    parameters:
+      - $ref: '#/components/parameters/ChatIdParam'
+    get:
+      operationId: getChatById
+      tags: [Chats]
+      summary: Get a single chat
+      description: The caller must be a participant.
+      responses:
+        '200':
+          description: Chat found.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [chat]
+                        properties: { chat: { $ref: '#/components/schemas/Chat' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenChatAccess' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateChat
+      tags: [Chats]
+      summary: Update a group chat (admin only)
+      description: |
+        Only group chats can be updated, and only by their current admin. Use this endpoint to rename the group
+        or transfer admin ownership (the new admin must already be a participant). Private chats are immutable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateChatRequest' }
+            examples:
+              rename:
+                value: { groupName: 'New Name' }
+              transferAdmin:
+                value: { admin: 8f5d18a3-32e6-4f0b-9d50-71b3a204bb77 }
+      responses:
+        '200':
+          description: Chat updated.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [chat]
+                        properties: { chat: { $ref: '#/components/schemas/Chat' } }
+        '400':
+          description: Validation failed, private chat cannot be updated, or the proposed admin is not a member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              examples:
+                privateChat:
+                  value:
+                    success: false
+                    error: { code: INVALID_CHAT_TYPE, message: Cannot update private chat }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+                adminNotMember:
+                  value:
+                    success: false
+                    error: { code: NOT_A_MEMBER, message: New admin must be a member of the group }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteChat
+      tags: [Chats]
+      summary: Delete a group chat (admin only)
+      description: Private chats cannot be deleted via this endpoint.
+      responses:
+        '200':
+          description: Chat deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+        '400':
+          description: Cannot delete a private chat.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: INVALID_CHAT_TYPE, message: Cannot delete private chat }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/chats/{chatId}/members:
+    parameters:
+      - $ref: '#/components/parameters/ChatIdParam'
+    get:
+      operationId: getChatMembers
+      tags: [Members]
+      summary: List members of a chat
+      description: The caller must be a participant.
+      responses:
+        '200':
+          description: Member list (full user records, no `password_hash`).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [members]
+                        properties:
+                          members:
+                            type: array
+                            items: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenChatAccess' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/chats/{chatId}/members/me:
+    parameters:
+      - $ref: '#/components/parameters/ChatIdParam'
+    delete:
+      operationId: leaveChat
+      tags: [Members]
+      summary: Leave a group chat
+      description: |
+        Removes the authenticated user from the group. If the caller is the admin and at least one other member
+        remains, ownership must be transferred first via `PATCH /api/v1/chats/{chatId}` (returns 409
+        `ADMIN_TRANSFER_REQUIRED`). The chat is automatically deleted when the final member leaves.
+      responses:
+        '200':
+          description: Caller has been removed from the group.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+        '400':
+          description: Cannot leave a private chat (use `DELETE /api/v1/users/me` instead).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: INVALID_CHAT_TYPE, message: Cannot remove members from private chat }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Admin must transfer ownership before leaving.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: ADMIN_TRANSFER_REQUIRED, message: Admin must transfer ownership before leaving }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+
+  /api/v1/chats/{chatId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/ChatIdParam'
+      - $ref: '#/components/parameters/UserIdParam'
+    post:
+      operationId: addChatMember
+      tags: [Members]
+      summary: Add a member to a group chat (admin only)
+      description: Private chats cannot accept new members.
+      responses:
+        '200':
+          description: Member added.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+        '400':
+          description: Cannot add members to a private chat.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: INVALID_CHAT_TYPE, message: Cannot add members to private chat }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: User is already a member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                success: false
+                error: { code: ALREADY_MEMBER, message: User is already a member of this group }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    delete:
+      operationId: removeChatMember
+      tags: [Members]
+      summary: Remove a specific member from a group chat (admin only)
+      description: Private chats cannot have members removed. Auto-deletes the chat if the final member is removed.
+      responses:
+        '200':
+          description: Member removed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+        '400':
+          description: Private chat or the target is not currently a member.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              examples:
+                private:
+                  value:
+                    success: false
+                    error: { code: INVALID_CHAT_TYPE, message: Cannot remove members from private chat }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+                notMember:
+                  value:
+                    success: false
+                    error: { code: MEMBER_NOT_FOUND, message: User is not a member of this group }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/AdminRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/chats/{chatId}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ChatIdParam'
+    post:
+      operationId: sendMessage
+      tags: [Messages]
+      summary: Send a text message to a chat
+      description: |
+        On success, the server emits a `message:new` Socket.io event to the chat room (see `asyncapi.yaml`).
+        Subject to the message rate limit (100 per 15 minutes).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+            example: { content: 'Hello, world!' }
+      responses:
+        '201':
+          description: Message persisted and broadcast.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [message]
+                        properties: { message: { $ref: '#/components/schemas/Message' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenChatAccess' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      operationId: listMessages
+      tags: [Messages]
+      summary: List messages in a chat
+      description: |
+        Returns a paginated list of messages. The default sort is `created_at DESC` (newest first) — pass
+        `sort=created_at` to reverse it.
+        Subject to the message rate limit (100 per 15 minutes).
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - $ref: '#/components/parameters/SortParam'
+      responses:
+        '200':
+          description: Paginated message list.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Message' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenChatAccess' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/chats/{chatId}/messages/{messageId}:
+    parameters:
+      - $ref: '#/components/parameters/ChatIdParam'
+      - $ref: '#/components/parameters/MessageIdParam'
+    get:
+      operationId: getMessageById
+      tags: [Messages]
+      summary: Get a single message
+      description: The message's `chat` must equal `chatId`; otherwise a 404 is returned.
+      responses:
+        '200':
+          description: Message found.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [message]
+                        properties: { message: { $ref: '#/components/schemas/Message' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenChatAccess' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      operationId: updateMessage
+      tags: [Messages]
+      summary: Edit a message (sender only)
+      description: |
+        Only the original sender may edit a message; there is no time window. On success, a `message:updated`
+        Socket.io event is broadcast to the chat room.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMessageRequest' }
+            example: { content: 'Edited message content.' }
+      responses:
+        '200':
+          description: Message updated.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [message]
+                        properties: { message: { $ref: '#/components/schemas/Message' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotMessageOwner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      operationId: deleteMessage
+      tags: [Messages]
+      summary: Delete a message (sender only)
+      description: |
+        Only the original sender may delete a message. On success, a `message:deleted` Socket.io event with
+        `{ messageId }` is broadcast to the chat room.
+      responses:
+        '200':
+          description: Message deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotMessageOwner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/messages/direct:
+    post:
+      operationId: sendDirectMessage
+      tags: [Messages]
+      summary: Send a direct message to a peer (lazy chat creation)
+      description: |
+        Send a text message to another user without first creating a chat. The server resolves (or lazily
+        creates) the private chat between the authenticated user and `peerId`, then persists the message
+        and broadcasts a `message:new` Socket.io event to the chat room (see `asyncapi.yaml`).
+
+        Each unordered pair of users maps to a single chat — calling this endpoint repeatedly between the
+        same two users always lands in the same chat. Concurrent first-messages from both peers also
+        converge to one chat (no duplicates).
+
+        Subject to the message rate limit (100 per 15 minutes).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendDirectMessageRequest' }
+            example:
+              peerId: b1ff2b8e-9c45-4f4d-9b6c-22d6c0b7ff5a
+              content: 'Hey, are you free?'
+      responses:
+        '201':
+          description: Message persisted and broadcast. Returns both the resolved chat and the new message.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [chat, message]
+                        properties:
+                          chat: { $ref: '#/components/schemas/Chat' }
+                          message: { $ref: '#/components/schemas/Message' }
+        '400':
+          description: Validation failed, peer is the caller, or peer does not exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              examples:
+                validation:
+                  summary: Joi validation failure
+                  value:
+                    success: false
+                    error:
+                      code: VALIDATION_FAILED
+                      message: Invalid request data
+                      details:
+                        - { path: 'body.peerId', message: 'Invalid peerId format. Must be a valid UUID.' }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+                selfChat:
+                  summary: peerId equals the authenticated user
+                  value:
+                    success: false
+                    error: { code: INVALID_PEER, message: Cannot start a chat with yourself }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+                missingPeer:
+                  summary: peerId did not resolve to a real user
+                  value:
+                    success: false
+                    error: { code: USER_NOT_FOUND, message: Peer user does not exist }
+                    timestamp: '2024-01-21T10:30:00.000Z'
+                    requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access token issued by `POST /api/v1/auth/login` or `/auth/refresh`. JWT signed with HS256, payload
+        `{ id, username, role, jti, iat, exp }`. Default TTL is 15 minutes (`ACCESS_TOKEN_TTL`).
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, default: 1 }
+      description: 1-indexed page number. Values below 1 are clamped to 1.
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      description: Page size. Clamped to the inclusive range `[1, 100]`.
+    SortParam:
+      name: sort
+      in: query
+      required: false
+      schema:
+        type: string
+        example: '-createdAt,username'
+      description: |
+        Comma-separated list of fields. Prefix a field with `-` to sort descending. The default — applied when
+        the parameter is omitted — is `created_at` descending (newest first).
+    SearchParam:
+      name: search
+      in: query
+      required: false
+      schema: { type: string }
+      description: Free-text search applied (POSIX regex, case-insensitive) to `username` and `email` for the user list.
+    RoleFilterParam:
+      name: role
+      in: query
+      required: false
+      schema: { $ref: '#/components/schemas/UserRole' }
+      description: Filter the user list by role.
+    ChatTypeFilterParam:
+      name: type
+      in: query
+      required: false
+      schema: { $ref: '#/components/schemas/ChatType' }
+      description: Filter the chat list by type.
+    UserIdParam:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: User UUID.
+    ChatIdParam:
+      name: chatId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Chat UUID.
+    MessageIdParam:
+      name: messageId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Message UUID.
+
+  responses:
+    BadRequest:
+      description: Validation failed. `details[]` lists each rejected path.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            success: false
+            error:
+              code: VALIDATION_FAILED
+              message: Invalid request data
+              details:
+                - { path: 'body.email', message: 'Invalid email address' }
+            timestamp: '2024-01-21T10:30:00.000Z'
+            requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    Unauthorized:
+      description: Missing, malformed, or expired access token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          examples:
+            missing:
+              value:
+                success: false
+                error: { code: MISSING_TOKEN, message: Authorization token missing }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+            malformed:
+              value:
+                success: false
+                error: { code: INVALID_TOKEN, message: Authorization token is malformed }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+            expired:
+              value:
+                success: false
+                error: { code: TOKEN_EXPIRED, message: 'Your session has expired. Please log in again' }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    ForbiddenChatAccess:
+      description: Caller is not a participant of the chat.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            success: false
+            error: { code: NOT_A_MEMBER, message: You are not a member of this chat }
+            timestamp: '2024-01-21T10:30:00.000Z'
+            requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    AdminRequired:
+      description: Action restricted to the group admin.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            success: false
+            error: { code: ADMIN_REQUIRED, message: Only the admin can update chat }
+            timestamp: '2024-01-21T10:30:00.000Z'
+            requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    NotMessageOwner:
+      description: Action restricted to the original message sender.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            success: false
+            error: { code: NOT_MESSAGE_OWNER, message: Only the author can modify this message }
+            timestamp: '2024-01-21T10:30:00.000Z'
+            requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    NotFound:
+      description: Resource does not exist (or is invisible to the caller).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            success: false
+            error: { code: NOT_FOUND, message: Resource not found }
+            timestamp: '2024-01-21T10:30:00.000Z'
+            requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    SignupConflict:
+      description: Email or username is already taken.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          examples:
+            email:
+              value:
+                success: false
+                error: { code: EMAIL_ALREADY_EXISTS, message: Email already exists }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+            username:
+              value:
+                success: false
+                error: { code: USERNAME_ALREADY_TAKEN, message: Username already taken }
+                timestamp: '2024-01-21T10:30:00.000Z'
+                requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    PayloadTooLarge:
+      description: Uploaded file exceeds the 5 MB (`MAX_FILE_SIZE`) limit.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            success: false
+            error: { code: PAYLOAD_TOO_LARGE, message: File size is too large }
+            timestamp: '2024-01-21T10:30:00.000Z'
+            requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    UnsupportedMediaType:
+      description: |
+        Avatar MIME type is not in the allowed set
+        (`image/jpeg`, `image/jpg`, `image/png`, `image/gif`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            success: false
+            error:
+              code: UNSUPPORTED_FILE_TYPE
+              message: 'Invalid file format. Please upload an image in one of the following formats: image/jpeg, image/jpg, image/png, image/gif'
+            timestamp: '2024-01-21T10:30:00.000Z'
+            requestId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+    TooManyRequests:
+      description: |
+        Rate limit exceeded. The body is generated by `express-rate-limit` (default plain text — clients must
+        not depend on its shape). Standard headers are guaranteed and tell you when to retry.
+      headers:
+        RateLimit-Limit:
+          description: Maximum requests permitted in the window.
+          schema: { type: integer }
+        RateLimit-Remaining:
+          description: Requests remaining in the current window.
+          schema: { type: integer }
+        RateLimit-Reset:
+          description: Seconds until the window resets.
+          schema: { type: integer }
+        Retry-After:
+          description: Seconds the client should wait before retrying.
+          schema: { type: integer }
+      content:
+        text/plain:
+          schema: { type: string }
+          example: 'Too many requests, please try again later.'
+
+  schemas:
+    UserRole:
+      type: string
+      enum: [user, admin]
+    ChatType:
+      type: string
+      enum: [private, group]
+    MessageType:
+      type: string
+      enum: [text, file]
+    MessageStatus:
+      type: string
+      enum: [sent, delivered, read]
+    HealthStatus:
+      type: string
+      enum: [OK, DEGRADED]
+    DependencyStatus:
+      type: string
+      enum: [connected, disconnected, error]
+
+    SuccessEnvelope:
+      type: object
+      required: [success, message, timestamp]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message:
+          type: string
+        data:
+          description: Operation-specific payload. `null` for endpoints that return only a status.
+          oneOf:
+            - { type: 'null' }
+            - { type: object }
+            - { type: array }
+        timestamp:
+          type: string
+          format: date-time
+
+    PaginationMeta:
+      type: object
+      required: [page, limit, total, totalPages, hasNextPage, hasPrevPage]
+      properties:
+        page: { type: integer, minimum: 1 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        total: { type: integer, minimum: 0 }
+        totalPages: { type: integer, minimum: 0 }
+        hasNextPage: { type: boolean }
+        hasPrevPage: { type: boolean }
+
+    PaginatedEnvelope:
+      description: |
+        Standard envelope for list endpoints. Note that `data` and `pagination` are siblings at the top level
+        (the `ApiResponse` helper spreads pagination metadata up).
+      type: object
+      required: [success, message, data, pagination, timestamp]
+      properties:
+        success:
+          type: boolean
+          const: true
+        message: { type: string }
+        data:
+          type: array
+          items: {}
+        pagination: { $ref: '#/components/schemas/PaginationMeta' }
+        timestamp:
+          type: string
+          format: date-time
+
+    ErrorEnvelope:
+      type: object
+      required: [success, error, timestamp]
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code (see Error reference below).
+            message:
+              type: string
+            details:
+              type: array
+              description: Per-field validation errors (only present when `code = VALIDATION_FAILED`).
+              items:
+                type: object
+                required: [path, message]
+                properties:
+                  path:
+                    type: string
+                    description: Dot-separated path inside the request, e.g. `body.email` or `params.chatId`.
+                  message:
+                    type: string
+        timestamp:
+          type: string
+          format: date-time
+        requestId:
+          type: string
+          format: uuid
+          description: Mirrors the `X-Request-Id` response header.
+        stack:
+          type: string
+          description: Present only when `NODE_ENV=development`.
+
+    UserSummary:
+      description: Minimal user shape returned by signup, login, and admin embeds.
+      type: object
+      required: [id, username, email, role]
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string, minLength: 3, maxLength: 20 }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/UserRole' }
+
+    User:
+      description: |
+        Full user profile DTO returned by `/users` and `/users/me`. Optional fields (`avatar`, `bio`, `lastSeen`,
+        `updatedAt`) are **omitted** from the response when their underlying value is falsy — they're not sent
+        as `null`.
+      type: object
+      required: [id, username, email, role, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        username:
+          type: string
+          minLength: 3
+          maxLength: 20
+          pattern: '^(?=[^.]*\.?[^.]*$)[a-zA-Z](?!.*[_]{2})[a-zA-Z0-9._]{1,28}[a-zA-Z0-9]$'
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/UserRole' }
+        avatar:
+          type: string
+          format: uri
+          description: Full S3 URL of the user's avatar.
+        bio:
+          type: string
+          maxLength: 200
+        lastSeen:
+          type: string
+          format: date-time
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Chat:
+      description: |
+        Chat DTO. `name` mirrors the underlying `groupName` field (only present for group chats); `picture`
+        mirrors `groupPicture`. For private chats, `admin` and `name` are absent.
+
+        Internally, private chats carry a deterministic `chatKey` (sorted participant IDs) used to enforce
+        one-chat-per-pair; this field is not exposed in the API response.
+      type: object
+      required: [id, type, participants, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/ChatType' }
+        name:
+          type: string
+          minLength: 1
+          maxLength: 50
+          description: Group name (groups only).
+        picture:
+          type: string
+          format: uri
+          description: Group picture URL (groups only). Not currently writable through the public REST API.
+        admin:
+          type: string
+          format: uuid
+          description: Group admin user ID (groups only).
+        participants:
+          type: array
+          items: { type: string, format: uuid }
+          minItems: 2
+          uniqueItems: true
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Message:
+      description: |
+        Discriminated union over `type`. Today the REST API only ever creates `text` messages — the `file`
+        variant exists in the data model and may be returned for messages persisted via other channels.
+      oneOf:
+        - $ref: '#/components/schemas/TextMessage'
+        - $ref: '#/components/schemas/FileMessage'
+      discriminator:
+        propertyName: type
+        mapping:
+          text: '#/components/schemas/TextMessage'
+          file: '#/components/schemas/FileMessage'
+
+    MessageBase:
+      type: object
+      required: [id, sender, chat, status, type, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        sender: { type: string, format: uuid, description: Sender user ID. }
+        chat: { type: string, format: uuid, description: Parent chat ID. }
+        status: { $ref: '#/components/schemas/MessageStatus' }
+        type: { $ref: '#/components/schemas/MessageType' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    TextMessage:
+      allOf:
+        - $ref: '#/components/schemas/MessageBase'
+        - type: object
+          required: [content]
+          properties:
+            type:
+              type: string
+              const: text
+            content:
+              type: string
+              minLength: 1
+              maxLength: 5000
+
+    FileMessage:
+      description: |
+        File message variant. Modeled in `src/models/message.model.js`. Not currently writable through the public
+        REST API, but documented here so clients render file payloads correctly when received.
+      allOf:
+        - $ref: '#/components/schemas/MessageBase'
+        - type: object
+          required: [file]
+          properties:
+            type:
+              type: string
+              const: file
+            content:
+              type: string
+              maxLength: 5000
+              description: Optional caption.
+            file:
+              type: object
+              required: [url, filename, mimetype]
+              properties:
+                url: { type: string, format: uri }
+                filename: { type: string }
+                mimetype: { type: string }
+
+    HealthReport:
+      type: object
+      required: [uptime, timestamp, status, environment, version, checks]
+      properties:
+        uptime:
+          type: number
+          description: Process uptime in seconds (`process.uptime()`).
+        timestamp:
+          type: integer
+          description: Unix epoch milliseconds (`Date.now()`).
+        status: { $ref: '#/components/schemas/HealthStatus' }
+        environment:
+          type: string
+          example: development
+        version:
+          type: string
+          description: Server `package.json` version.
+        checks:
+          type: object
+          required: [mongodb, postgresql, redis]
+          properties:
+            mongodb: { $ref: '#/components/schemas/DependencyStatus' }
+            postgresql: { $ref: '#/components/schemas/DependencyStatus' }
+            redis: { $ref: '#/components/schemas/DependencyStatus' }
+
+    SignupRequest:
+      type: object
+      required: [email, username, password]
+      properties:
+        email:
+          type: string
+          format: email
+          description: Trimmed and lowercased server-side.
+        username:
+          type: string
+          minLength: 3
+          maxLength: 20
+          pattern: '^(?=[^.]*\.?[^.]*$)[a-zA-Z](?!.*[_]{2})[a-zA-Z0-9._]{1,28}[a-zA-Z0-9]$'
+          description: Must start with a letter; may contain letters, digits, dots, and underscores; no consecutive underscores; max one dot.
+        password:
+          type: string
+          minLength: 8
+          pattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#])[A-Za-z\d@$!%*?&#]{8,}$'
+          description: |
+            Must contain at least one lowercase letter, one uppercase letter, one digit, and one special character
+            from the set `@$!%*?&#`.
+
+    LoginRequest:
+      type: object
+      required: [password]
+      description: Provide exactly one of `email` or `username` (XOR enforced server-side).
+      properties:
+        email: { type: string, format: email }
+        username: { type: string, minLength: 3, maxLength: 20 }
+        password: { type: string }
+      oneOf:
+        - required: [email, password]
+          not: { required: [username] }
+        - required: [username, password]
+          not: { required: [email] }
+
+    RefreshTokenForm:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          description: 128-character hex refresh token issued at login.
+
+    AuthSession:
+      type: object
+      required: [user, accessToken, refreshToken]
+      properties:
+        user: { $ref: '#/components/schemas/UserSummary' }
+        accessToken:
+          type: string
+          description: JWT access token. Default TTL 15 minutes.
+        refreshToken:
+          type: string
+          description: 128-character hex refresh token. Default TTL 7 days.
+
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken]
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+
+    UpdateMeRequest:
+      type: object
+      minProperties: 1
+      description: At least one field is required.
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 20
+          pattern: '^(?=[^.]*\.?[^.]*$)[a-zA-Z](?!.*[_]{2})[a-zA-Z0-9._]{1,28}[a-zA-Z0-9]$'
+        bio:
+          type: string
+          maxLength: 200
+
+    ChangePasswordRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword: { type: string }
+        newPassword:
+          type: string
+          minLength: 8
+          pattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#])[A-Za-z\d@$!%*?&#]{8,}$'
+          description: Must differ from `currentPassword` and satisfy the password complexity rule.
+
+    AvatarUploadRequest:
+      type: object
+      required: [avatar]
+      properties:
+        avatar:
+          type: string
+          format: binary
+          description: |
+            Image file. Max 5 MB. Allowed MIME types: `image/jpeg`, `image/jpg`, `image/png`, `image/gif`.
+
+    CreateChatRequest:
+      oneOf:
+        - $ref: '#/components/schemas/CreatePrivateChatRequest'
+        - $ref: '#/components/schemas/CreateGroupChatRequest'
+      discriminator:
+        propertyName: type
+        mapping:
+          private: '#/components/schemas/CreatePrivateChatRequest'
+          group: '#/components/schemas/CreateGroupChatRequest'
+
+    CreatePrivateChatRequest:
+      type: object
+      required: [type, participants]
+      properties:
+        type:
+          type: string
+          const: private
+        participants:
+          type: array
+          minItems: 1
+          maxItems: 1
+          uniqueItems: true
+          items: { type: string, format: uuid }
+          description: |
+            Exactly one *other* user. The authenticated user is auto-added server-side, bringing the total to 2.
+      not:
+        required: [groupName]
+
+    CreateGroupChatRequest:
+      type: object
+      required: [type, participants, groupName]
+      properties:
+        type:
+          type: string
+          const: group
+        groupName:
+          type: string
+          minLength: 1
+          maxLength: 50
+        participants:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, format: uuid }
+          description: At least one *other* user; the creator is auto-added.
+
+    UpdateChatRequest:
+      type: object
+      minProperties: 1
+      properties:
+        groupName:
+          type: string
+          minLength: 1
+          maxLength: 50
+        admin:
+          type: string
+          format: uuid
+          description: Transfer admin to this user (must already be a participant).
+
+    SendMessageRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 5000
+
+    UpdateMessageRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 5000
+
+    SendDirectMessageRequest:
+      type: object
+      required: [peerId, content]
+      properties:
+        peerId:
+          type: string
+          format: uuid
+          description: The other participant. Must be a different user than the authenticated caller.
+        content:
+          type: string
+          minLength: 1
+          maxLength: 5000

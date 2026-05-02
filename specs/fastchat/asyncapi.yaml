@@ -1,0 +1,464 @@
+asyncapi: '2.6.0'
+
+info:
+  title: fastchat WebSocket API
+  version: 1.0.0
+  description: |
+    fastchat exposes a Socket.io 4.8.1 layer for real-time chat features:
+
+    - **Message delivery** — `message:new`, `message:updated`, `message:deleted` are broadcast to the
+      relevant chat room when REST mutations succeed. Messages are *sent* via the REST API
+      (`POST /api/v1/chats/{chatId}/messages`, or `POST /api/v1/messages/direct` for lazy private
+      chats), not over the socket.
+    - **Delivery & read receipts** — clients emit `message:delivered` and `message:read` to update a
+      message's stored status.
+    - **Typing indicators** — clients emit `message:start-typing` / `message:stop-typing`; the server
+      forwards them to the room (excluding the sender) with the originator's `userId` injected.
+    - **Online presence** — `user:online` is broadcast on a user's first socket connection;
+      `user:offline` is broadcast on the last disconnect (multi-tab / multi-device safe via Redis).
+
+    ## Transport
+
+    Connect with the `socket.io-client` library, not raw WebSocket:
+
+    ```js
+    import { io } from 'socket.io-client'
+    const socket = io('http://localhost:3000', { auth: { token: accessToken } })
+    ```
+
+    The default Socket.io path `/socket.io` is in use. CORS allow-list comes from the `ALLOWED_ORIGINS`
+    environment variable (comma-separated).
+
+    ## Authentication
+
+    The JWT access token from `POST /api/v1/auth/login` is supplied during the handshake:
+
+    - **Preferred**: `socket.handshake.auth.token`
+    - **Alternative**: `socket.handshake.headers.token`
+
+    A failed handshake emits `connect_error` on the client with one of:
+    `MISSING_TOKEN`, `INVALID_TOKEN`, `TOKEN_EXPIRED`, `TOKEN_NOT_ACTIVE`.
+
+    On success, `socket.userId` is set to the JWT's `id` claim. The token is **not** re-validated for
+    the lifetime of the connection — clients should reconnect after rotating tokens.
+
+    ## Rooms
+
+    The single room convention is the chat ID (a UUID, no prefix). A client must explicitly emit
+    `chat:join` to receive `message:*` and `message:start-typing`/`message:stop-typing` events for
+    that chat. Room membership is **not** persisted across reconnects — re-emit `chat:join` for each
+    active chat in the `connect` handler.
+
+    > **Note (no server-side authorization on `chat:join` / `chat:leave`):** The server does not
+    > verify that the authenticated user is a participant of the chat before joining the room.
+    > Production deployments should treat `chat:*` events as advisory and rely on REST-level
+    > authorization (services already enforce participation for sends/edits/reads).
+    >
+    > **Note (no authorization on receipts):** `message:delivered` and `message:read` update the
+    > message status without checking that the emitting user is a chat participant or the recipient.
+
+    ## Acknowledgements & error events
+
+    No client-side acknowledgement callbacks are used. The server does not emit a domain-specific error
+    event — handler errors are logged server-side only. The only connection-time error path is the
+    Socket.io `connect_error` event during the handshake.
+
+  contact:
+    name: fastchat
+  license:
+    name: ISC
+
+defaultContentType: application/json
+
+servers:
+  development:
+    url: localhost:3000/socket.io
+    protocol: socketio
+    description: |
+      Local development Socket.io server. Connect with `socket.io-client` to `http://localhost:3000`
+      (the `/socket.io` path is the Socket.io engine default).
+    security:
+      - accessToken: []
+    bindings:
+      ws:
+        method: GET
+
+channels:
+  /:
+    description: |
+      Connection lifecycle.
+
+      The Socket.io engine establishes a single multiplexed connection. Authentication runs once
+      during the handshake; afterward all events flow over the same connection.
+
+      Failed handshakes emit `connect_error` on the client (Socket.io built-in event, not modeled as
+      an AsyncAPI message).
+    bindings:
+      ws:
+        method: GET
+        bindingVersion: '0.1.0'
+
+  chat:join:
+    description: |
+      Subscribe the current socket to a chat room. Emit this when the user opens a chat view.
+      The server does not verify chat membership — clients must only join their own chats.
+    publish:
+      operationId: chatJoin
+      summary: Client → server. Join a chat room.
+      message:
+        $ref: '#/components/messages/ChatJoin'
+
+  chat:leave:
+    description: |
+      Unsubscribe the current socket from a chat room. Emit when the user closes a chat view to
+      free server-side memory. Disconnects implicitly leave all rooms.
+    publish:
+      operationId: chatLeave
+      summary: Client → server. Leave a chat room.
+      message:
+        $ref: '#/components/messages/ChatLeave'
+
+  message:new:
+    description: |
+      Broadcast to the `<chatId>` room after a successful `POST /api/v1/chats/{chatId}/messages` or
+      `POST /api/v1/messages/direct` (the latter lazily creates the private chat on first send and
+      broadcasts to the resolved chat ID). Sent to **every** socket in the room, including the
+      sender's own sockets.
+    subscribe:
+      operationId: onMessageNew
+      summary: Server → client. A new message has been persisted.
+      message:
+        $ref: '#/components/messages/MessageNew'
+
+  message:updated:
+    description: |
+      Broadcast to the `<chatId>` room after a successful
+      `PATCH /api/v1/chats/{chatId}/messages/{messageId}`.
+    subscribe:
+      operationId: onMessageUpdated
+      summary: Server → client. A message has been edited.
+      message:
+        $ref: '#/components/messages/MessageUpdated'
+
+  message:deleted:
+    description: |
+      Broadcast to the `<chatId>` room after a successful
+      `DELETE /api/v1/chats/{chatId}/messages/{messageId}`.
+    subscribe:
+      operationId: onMessageDeleted
+      summary: Server → client. A message has been deleted.
+      message:
+        $ref: '#/components/messages/MessageDeleted'
+
+  message:delivered:
+    description: |
+      Reports that a message has been rendered on this client. The server updates the message's
+      `status` to `'delivered'` in MongoDB. Errors are swallowed (logged server-side only); there
+      is no acknowledgement.
+
+      > No authorization check — any authenticated socket can mutate any message status if it knows
+      > the message ID.
+    publish:
+      operationId: messageDelivered
+      summary: Client → server. Mark message as delivered.
+      message:
+        $ref: '#/components/messages/MessageDeliveredAck'
+
+  message:read:
+    description: |
+      Reports that the user has read a message. The server updates the message's `status` to
+      `'read'` in MongoDB. Errors are swallowed (logged server-side only).
+    publish:
+      operationId: messageRead
+      summary: Client → server. Mark message as read.
+      message:
+        $ref: '#/components/messages/MessageReadAck'
+
+  message:start-typing:
+    description: |
+      Bidirectional typing-start signal.
+
+      - **Client → server**: payload `{ chatId }`. Server forwards it to the room.
+      - **Server → client**: payload `{ userId, chatId }` — the server adds the originator's
+        `userId` and broadcasts to all sockets in `<chatId>` *except* the sender.
+
+      Server does no debouncing; clients should debounce keystrokes (e.g., emit on input then auto-emit
+      `message:stop-typing` after ~3 s of inactivity).
+    publish:
+      operationId: typingStart
+      summary: Client → server. Signal that the user started typing.
+      message:
+        $ref: '#/components/messages/TypingStartFromClient'
+    subscribe:
+      operationId: onTypingStart
+      summary: Server → client. Another user in the room started typing.
+      message:
+        $ref: '#/components/messages/TypingStartFromServer'
+
+  message:stop-typing:
+    description: |
+      Bidirectional typing-stop signal.
+
+      - **Client → server**: payload `{ chatId }`.
+      - **Server → client**: payload `{ userId, chatId }`, broadcast to the room except the sender.
+    publish:
+      operationId: typingStop
+      summary: Client → server. Signal that the user stopped typing.
+      message:
+        $ref: '#/components/messages/TypingStopFromClient'
+    subscribe:
+      operationId: onTypingStop
+      summary: Server → client. Another user in the room stopped typing.
+      message:
+        $ref: '#/components/messages/TypingStopFromServer'
+
+  user:online:
+    description: |
+      Broadcast on a user's **first** socket connection (i.e., when the Redis set
+      `online:<userId>` transitions from 0 to 1). Sent to all currently-connected sockets except the
+      one that just connected.
+    subscribe:
+      operationId: onUserOnline
+      summary: Server → client. A user came online.
+      message:
+        $ref: '#/components/messages/UserOnline'
+
+  user:offline:
+    description: |
+      Broadcast on a user's **last** socket disconnection (i.e., when the Redis set
+      `online:<userId>` transitions to 0). Sent to all other connected sockets.
+    subscribe:
+      operationId: onUserOffline
+      summary: Server → client. A user went offline.
+      message:
+        $ref: '#/components/messages/UserOffline'
+
+components:
+  securitySchemes:
+    accessToken:
+      type: apiKey
+      in: user
+      description: |
+        JWT access token (HS256), supplied during the Socket.io handshake.
+
+        Preferred location: `socket.handshake.auth.token`. Also accepted:
+        `socket.handshake.headers.token`. AsyncAPI 2.6 has no first-class Socket.io handshake-auth
+        scheme, so this is modeled as `apiKey` with `in: user` for tooling compatibility — the
+        actual mechanism is the Socket.io handshake `auth` payload. The token must be the same JWT
+        issued by `POST /api/v1/auth/login`.
+
+  messages:
+    ChatJoin:
+      name: ChatJoin
+      title: Join chat room
+      summary: Client subscribes the current socket to a chat room.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChatRoomReference'
+      examples:
+        - name: simple
+          summary: Join a chat
+          payload:
+            chatId: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+
+    ChatLeave:
+      name: ChatLeave
+      title: Leave chat room
+      summary: Client unsubscribes the current socket from a chat room.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChatRoomReference'
+
+    MessageNew:
+      name: MessageNew
+      title: New message
+      summary: A new chat message has been persisted and is being broadcast to the room.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/Message'
+
+    MessageUpdated:
+      name: MessageUpdated
+      title: Message updated
+      summary: An existing message has been edited.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/Message'
+
+    MessageDeleted:
+      name: MessageDeleted
+      title: Message deleted
+      summary: A message has been deleted.
+      contentType: application/json
+      payload:
+        type: object
+        required: [messageId]
+        properties:
+          messageId:
+            type: string
+            format: uuid
+            description: ID of the deleted message.
+
+    MessageDeliveredAck:
+      name: MessageDeliveredAck
+      title: Mark delivered
+      summary: Client reports a message was rendered.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/MessageReference'
+
+    MessageReadAck:
+      name: MessageReadAck
+      title: Mark read
+      summary: Client reports a message was read.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/MessageReference'
+
+    TypingStartFromClient:
+      name: TypingStartFromClient
+      title: Typing started (client)
+      summary: User started typing in a chat.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChatRoomReference'
+
+    TypingStartFromServer:
+      name: TypingStartFromServer
+      title: Typing started (server)
+      summary: Forwarded typing-start from another user in the room.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/TypingBroadcast'
+
+    TypingStopFromClient:
+      name: TypingStopFromClient
+      title: Typing stopped (client)
+      summary: User stopped typing in a chat.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChatRoomReference'
+
+    TypingStopFromServer:
+      name: TypingStopFromServer
+      title: Typing stopped (server)
+      summary: Forwarded typing-stop from another user in the room.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/TypingBroadcast'
+
+    UserOnline:
+      name: UserOnline
+      title: User came online
+      summary: A user's first socket connected.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/UserPresence'
+
+    UserOffline:
+      name: UserOffline
+      title: User went offline
+      summary: A user's last socket disconnected.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/UserPresence'
+
+  schemas:
+    MessageType:
+      type: string
+      enum: [text, file]
+    MessageStatus:
+      type: string
+      enum: [sent, delivered, read]
+
+    ChatRoomReference:
+      type: object
+      required: [chatId]
+      properties:
+        chatId:
+          type: string
+          format: uuid
+          description: Chat UUID — used as the Socket.io room name.
+
+    MessageReference:
+      type: object
+      required: [messageId]
+      properties:
+        messageId:
+          type: string
+          format: uuid
+
+    TypingBroadcast:
+      type: object
+      required: [userId, chatId]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: ID of the user who is typing (or stopped).
+        chatId:
+          type: string
+          format: uuid
+
+    UserPresence:
+      type: object
+      required: [userId]
+      properties:
+        userId:
+          type: string
+          format: uuid
+
+    Message:
+      description: |
+        Chat message DTO. Mirrors the REST `Message` schema in `openapi.yaml`. The optional `file`
+        field is present for `type=file` messages (data-model only — no REST endpoint creates them
+        today).
+      type: object
+      required: [id, sender, chat, status, type, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        content:
+          type: string
+          maxLength: 5000
+          description: Required for `type=text` messages; may be an optional caption for `type=file`.
+        sender:
+          type: string
+          format: uuid
+          description: Sender user ID.
+        chat:
+          type: string
+          format: uuid
+          description: Parent chat ID (matches the room name).
+        status:
+          $ref: '#/components/schemas/MessageStatus'
+        type:
+          $ref: '#/components/schemas/MessageType'
+        file:
+          type: object
+          description: Present only when `type=file`.
+          required: [url, filename, mimetype]
+          properties:
+            url:
+              type: string
+              format: uri
+            filename:
+              type: string
+            mimetype:
+              type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      examples:
+        - id: 9b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+          content: 'Hello, world!'
+          sender: 4d1e92f0-9f67-4c4e-8a47-2b40bb5a91b9
+          chat: 5b1d6df8-3e0d-4f7d-bc55-d9b2dfb1a4f7
+          status: sent
+          type: text
+          createdAt: '2024-01-21T10:30:00.000Z'
+          updatedAt: '2024-01-21T10:30:00.000Z'

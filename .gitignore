@@ -1,0 +1,9 @@
+node_modules/
+web/node_modules/
+web/dist/
+web/src/generated/
+.DS_Store
+*.log
+.env
+.env.local
+.vite/

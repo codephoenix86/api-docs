@@ -1,0 +1,22 @@
+name: Lint specs
+
+on:
+  pull_request:
+    paths:
+      - 'specs/**'
+      - '.spectral.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'specs/**'
+      - '.spectral.yaml'
+
+jobs:
+  spectral:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: stoplightio/spectral-action@latest
+        with:
+          file_glob: 'specs/**/*.yaml'
+          spectral_ruleset: '.spectral.yaml'

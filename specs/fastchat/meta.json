@@ -1,0 +1,9 @@
+{
+  "slug": "fastchat",
+  "name": "fastchat",
+  "tagline": "Real-time chat backend — REST + Socket.io.",
+  "brand": "#5b5bd6",
+  "order": 1,
+  "repo": "https://github.com/codephoenix86/api-docs",
+  "specRoot": "specs/fastchat"
+}
