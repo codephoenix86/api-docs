@@ -21,24 +21,13 @@ export function HomePage() {
             on every commit.
           </p>
           <div className="mt-7 flex flex-wrap gap-3">
-            {registry.length === 1 && (
-              <Link
-                to={`/${registry[0].slug}`}
-                className="inline-flex items-center gap-2 rounded-md px-4 py-2.5 text-[14px] font-medium text-white"
-                style={{ background: 'var(--color-brand)' }}
-              >
-                Browse the API <ArrowRight size={14} />
-              </Link>
-            )}
-            {registry.length > 1 && (
-              <a
-                href="#apis"
-                className="inline-flex items-center gap-2 rounded-md px-4 py-2.5 text-[14px] font-medium text-white"
-                style={{ background: 'var(--color-brand)' }}
-              >
-                Browse APIs <ArrowRight size={14} />
-              </a>
-            )}
+            <a
+              href="#apis"
+              className="inline-flex items-center gap-2 rounded-md px-4 py-2.5 text-[14px] font-medium text-white"
+              style={{ background: 'var(--color-brand)' }}
+            >
+              Browse APIs <ArrowRight size={14} />
+            </a>
             <a
               href="https://github.com/codephoenix86/api-docs"
               target="_blank"
@@ -51,7 +40,7 @@ export function HomePage() {
         </div>
       </section>
 
-      <section>
+      <section id="apis" className="scroll-mt-20">
         <h2 className="text-[11.5px] uppercase tracking-wider font-semibold text-[color:var(--color-text-muted)] mb-3">
           APIs
         </h2>
